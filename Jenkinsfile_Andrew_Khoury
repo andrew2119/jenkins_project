@@ -1,0 +1,95 @@
+pipeline {
+    agent any
+
+    options {
+        disableConcurrentBuilds()
+        skipStagesAfterUnstable()
+        timeout(time: 15, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '10'))
+    }
+
+    environment {
+        VIRTUAL_ENV = 'venv'
+        // This directory survives workspace cleanup after the build.
+        APP_DEPLOY_DIR = "${env.JENKINS_HOME}/deployments/jenkins_project"
+    }
+
+    stages {
+        stage('Setup') {
+            steps {
+                sh '''
+                    set -eu
+                    python3 -m venv "$VIRTUAL_ENV"
+                    "$VIRTUAL_ENV/bin/python" -m pip install -r requirements.txt
+                    mkdir -p reports
+                    "$VIRTUAL_ENV/bin/python" -m pip freeze > reports/dependencies.txt
+                '''
+            }
+        }
+
+        stage('Lint') {
+            steps {
+                sh '''
+                    set -eu
+                    "$VIRTUAL_ENV/bin/python" -m flake8 app.py deploy.py tests \
+                        --output-file=reports/flake8.txt
+                    echo "Flake8 passed: no style violations."
+                '''
+            }
+        }
+
+        stage('Test') {
+            steps {
+                sh '"$VIRTUAL_ENV/bin/python" -m pytest -v --junitxml=reports/tests.xml'
+            }
+        }
+
+        stage('Coverage') {
+            steps {
+                sh '''
+                    set -eu
+                    "$VIRTUAL_ENV/bin/python" -m coverage run -m pytest -q
+                    "$VIRTUAL_ENV/bin/python" -m coverage xml
+                    "$VIRTUAL_ENV/bin/python" -m coverage html
+                    "$VIRTUAL_ENV/bin/python" -m coverage report > reports/coverage.txt
+                    cat reports/coverage.txt
+                '''
+            }
+        }
+
+        stage('Security Scan') {
+            steps {
+                sh '''
+                    set -eu
+                    "$VIRTUAL_ENV/bin/python" -m bandit app.py deploy.py \
+                        -f json -o reports/bandit.json
+                    echo "Bandit passed: no security issues found."
+                '''
+            }
+        }
+
+        stage('Deploy') {
+            steps {
+                sh '''
+                    set -eu
+                    "$VIRTUAL_ENV/bin/python" deploy.py --target "$APP_DEPLOY_DIR"
+                    "$VIRTUAL_ENV/bin/python" "$APP_DEPLOY_DIR/app.py" \
+                        > reports/deployment-output.txt
+                    cat reports/deployment-output.txt
+                    grep -Fx 'Hello, World from Andrew Khoury!' \
+                        reports/deployment-output.txt
+                '''
+            }
+        }
+    }
+
+    post {
+        always {
+            archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+            junit testResults: 'reports/tests.xml', allowEmptyResults: true
+        }
+        cleanup {
+            cleanWs(deleteDirs: true, disableDeferredWipeout: true)
+        }
+    }
+}
